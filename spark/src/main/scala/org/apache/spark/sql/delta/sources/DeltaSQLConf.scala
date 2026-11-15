@@ -2594,6 +2594,16 @@ trait DeltaSQLConfBase extends DeltaSQLConfUtils {
       .booleanConf
       .createWithDefault(true)
 
+  val DELTA_CONFLICT_DETECTION_NARROW_SELF_SCAN_READ_SCOPE =
+    buildConf("conflictDetection.narrowSelfScanReadScope.enabled")
+      .doc("When true, a command that reads and writes the same Delta table records the actual " +
+        "partition predicates of its self-scan for conflict detection instead of conservatively " +
+        "tainting the whole table. This lets concurrent appends to disjoint partitions commit " +
+        "without conflict. When false, the legacy whole-table tainting behavior is used.")
+      .internal()
+      .booleanConf
+      .createWithDefault(true)
+
   val DELTA_UNIFORM_ICEBERG_TABLE_V3_ENABLED =
     buildConf("uniform.iceberg.v3.enabled")
       .internal()

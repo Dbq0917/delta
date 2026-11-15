@@ -244,13 +244,23 @@ trait PrepareDeltaScanBase extends Rule[LogicalPlan]
 
   protected def prepareDeltaScanWithoutFileSkipping(plan: LogicalPlan): LogicalPlan = {
     // If this query is running inside an active transaction and is touching the same table
-    // as the transaction, then mark that the entire table as tainted to be safe.
+    // as the transaction, then record the read so conflict detection can reject concurrent
+    // commits that add files this transaction should have seen. When the self-scan only touches a
+    // subset of partitions, record the concrete partition predicates instead of conservatively
+    // tainting the whole table, so concurrent appends to disjoint partitions can still commit.
     OptimisticTransaction.getActive().foreach { txn =>
-      val logsInPlan = plan.collect { case DeltaTable(fileIndex: TahoeFileIndex) =>
-        fileIndex.deltaLog
+      val narrowReadScope = spark.conf.get(
+        DeltaSQLConf.DELTA_CONFLICT_DETECTION_NARROW_SELF_SCAN_READ_SCOPE)
+      val selfScanIndices = plan.collect {
+        case DeltaTable(fileIndex: TahoeFileIndex)
+          if fileIndex.deltaLog.isSameLogAs(txn.deltaLog) => fileIndex
       }
-      if (logsInPlan.exists(_.isSameLogAs(txn.deltaLog))) {
-        txn.readWholeTable()
+      selfScanIndices.foreach {
+        case logFileIndex: TahoeLogFileIndex if narrowReadScope =>
+          txn.recordPartitionScopedRead(logFileIndex.partitionFilters)
+        case _ =>
+          // A batch file index carries no analysis-time partition predicates; stay conservative.
+          txn.readWholeTable()
       }
     }
 

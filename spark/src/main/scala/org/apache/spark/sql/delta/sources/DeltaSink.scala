@@ -23,6 +23,7 @@ import org.apache.spark.sql.delta.Relocated._
 import org.apache.spark.sql.delta.ClassicColumnConversions._
 import org.apache.spark.sql.delta.DeltaOperations.StreamingUpdate
 import org.apache.spark.sql.delta.actions.{FileAction, Metadata, Protocol, SetTransaction}
+import org.apache.spark.sql.delta.files.TahoeLogFileIndex
 import org.apache.spark.sql.delta.logging.DeltaLogKeys
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.schema.{ImplicitMetadataOperation, SchemaMergingUtils, SchemaUtils}
@@ -127,15 +128,24 @@ case class DeltaSink(
       data.queryExecution.analyzed)
 
     // If the batch reads the same Delta table as this sink is going to write to, then this
-    // write has dependencies. Then make sure that this commit set hasDependencies to true
-    // by injecting a read on the whole table. This needs to be done explicitly because
-    // MicroBatchExecution has already enforced all the data skipping (by forcing the generation
-    // of the executed plan) even before the transaction was started.
-    val selfScan = data.queryExecution.analyzed.collectFirst {
-      case DeltaTable(index) if index.deltaLog.isSameLogAs(txn.deltaLog) => true
-    }.nonEmpty
-    if (selfScan) {
-      txn.readWholeTable()
+    // write has dependencies. Record the read explicitly because MicroBatchExecution has already
+    // enforced data skipping (by forcing the executed plan) before the transaction was started.
+    // Record the concrete partition predicates of each self-scan so concurrent appends to
+    // disjoint partitions can still commit; fall back to tainting the whole table when a scan has
+    // no partition pruning or its read scope cannot be represented by partition predicates.
+    val selfScanIndices = data.queryExecution.analyzed.collect {
+      case DeltaTable(index) if index.deltaLog.isSameLogAs(txn.deltaLog) => index
+    }
+    if (selfScanIndices.nonEmpty) {
+      val narrowReadScope = data.sparkSession.conf.get(
+        DeltaSQLConf.DELTA_CONFLICT_DETECTION_NARROW_SELF_SCAN_READ_SCOPE)
+      selfScanIndices.foreach {
+        case logFileIndex: TahoeLogFileIndex if narrowReadScope =>
+          txn.recordPartitionScopedRead(logFileIndex.partitionFilters)
+        case _ =>
+          // A batch file index carries no analysis-time partition predicates; stay conservative.
+          txn.readWholeTable()
+      }
     }
 
     val writeSchema = getWriteSchema(txn.protocol, txn.metadata, data.schema)

@@ -1494,6 +1494,25 @@ trait OptimisticTransactionImpl extends TransactionHelper
     readTheWholeTable = true
   }
 
+  /**
+   * Record the partitions read by a self-scan of this table.
+   *
+   * A command that reads and writes the same Delta table inside one transaction must record the
+   * read so that conflict detection can reject concurrent commits that add files the transaction
+   * should have seen. When the scan only touches a subset of partitions, recording the concrete
+   * partition predicates is sufficient and lets concurrent appends to disjoint partitions commit.
+   * A read without partition pruning covers the whole table and is recorded as such.
+   *
+   * @param partitionFilters partition-column predicates pushed down to the self-scan
+   */
+  def recordPartitionScopedRead(partitionFilters: Seq[Expression]): Unit = {
+    if (partitionFilters.isEmpty) {
+      readWholeTable()
+    } else {
+      trackReadPredicates(partitionFilters, partitionOnly = true)
+    }
+  }
+
   /** Mark the given files as read within this transaction. */
   def trackFilesRead(files: Seq[AddFile]): Unit = {
     readFiles.addAll(files.asJava)

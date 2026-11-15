@@ -294,6 +294,57 @@ class OptimisticTransactionSuite
       AddFile("b", Map.empty, 1, 1, dataChange = true)))
 
   check(
+    "partition scoped self read allows concurrent append to a disjoint partition",
+    conflicts = false,
+    setup = Seq(
+      Metadata(
+        schemaString = new StructType().add("x", IntegerType).json,
+        partitionColumns = Seq("x"))
+    ),
+    reads = Seq(
+      // The transaction only reads partition x=1, so an append into x=2 is not a conflict.
+      t => t.recordPartitionScopedRead(Seq(EqualTo('x, Literal(1))))
+    ),
+    concurrentWrites = Seq(
+      AddFile("a", Map("x" -> "2"), 1, 1, dataChange = true)),
+    actions = Seq(
+      AddFile("b", Map("x" -> "1"), 1, 1, dataChange = true)))
+
+  check(
+    "partition scoped self read conflicts with concurrent append into the read partition",
+    conflicts = true,
+    setup = Seq(
+      Metadata(
+        schemaString = new StructType().add("x", IntegerType).json,
+        partitionColumns = Seq("x"))
+    ),
+    reads = Seq(
+      t => t.recordPartitionScopedRead(Seq(EqualTo('x, Literal(1))))
+    ),
+    concurrentWrites = Seq(
+      AddFile("a", Map("x" -> "1"), 1, 1, dataChange = true)),
+    actions = Seq(
+      AddFile("b", Map("x" -> "1"), 1, 1, dataChange = true)))
+
+  check(
+    "partition scoped self read without filters taints the whole table",
+    conflicts = true,
+    setup = Seq(
+      Metadata(
+        schemaString = new StructType().add("x", IntegerType).json,
+        partitionColumns = Seq("x")),
+      AddFile("a", Map("x" -> "2"), 1, 1, dataChange = true)
+    ),
+    reads = Seq(
+      // No partition pruning means the read covers the whole table.
+      t => t.recordPartitionScopedRead(Seq.empty)
+    ),
+    concurrentWrites = Seq(
+      AddFile("b", Map("x" -> "3"), 1, 1, dataChange = true)),
+    actions = Seq(
+      AddFile("c", Map("x" -> "4"), 1, 1, dataChange = true)))
+
+  check(
     "multiple concurrent appends",
     conflicts = false,
     initialSetup = { log =>
@@ -395,6 +446,69 @@ class OptimisticTransactionSuite
   override def beforeEach(): Unit = {
     super.beforeEach()
     CommitCoordinatorProvider.clearNonDefaultBuilders()
+  }
+
+  test("partition scoped self read narrows concurrent append conflicts to the read partition") {
+    withTempDir { dir =>
+      val path = dir.getCanonicalPath
+      spark.range(6).selectExpr("id", "id % 2 AS p")
+        .write.format("delta").partitionBy("p").save(path)
+      val deltaLog = DeltaLog.forTable(spark, path)
+
+      def runConcurrentAppend(readPartition: Int, writePartition: Int): Unit = {
+        val currentTxn = deltaLog.startTransaction()
+        currentTxn.recordPartitionScopedRead(Seq(EqualTo('p, Literal(readPartition))))
+        // A concurrent transaction appends into `writePartition` after the current read.
+        val winningTxn = deltaLog.startTransaction()
+        winningTxn.commit(
+          Seq(AddFile(
+            path = s"winner-p$writePartition",
+            partitionValues = Map("p" -> writePartition.toString),
+            size = 1L,
+            modificationTime = 1L,
+            dataChange = true)),
+          ManualUpdate)
+        currentTxn.commit(
+          Seq(AddFile(
+            path = s"current-p$readPartition",
+            partitionValues = Map("p" -> readPartition.toString),
+            size = 1L,
+            modificationTime = 1L,
+            dataChange = true)),
+          ManualUpdate)
+      }
+
+      // A concurrent append into a disjoint partition is allowed.
+      runConcurrentAppend(readPartition = 0, writePartition = 1)
+
+      // A concurrent append into the read partition is still rejected.
+      intercept[DeltaConcurrentModificationException] {
+        runConcurrentAppend(readPartition = 0, writePartition = 0)
+      }
+
+      // A read with no partition predicates is equivalent to the legacy whole-table taint.
+      val currentTxn = deltaLog.startTransaction()
+      currentTxn.recordPartitionScopedRead(Seq.empty)
+      val winningTxn = deltaLog.startTransaction()
+      winningTxn.commit(
+        Seq(AddFile(
+          path = "winner-legacy",
+          partitionValues = Map("p" -> "1"),
+          size = 1L,
+          modificationTime = 1L,
+          dataChange = true)),
+        ManualUpdate)
+      intercept[DeltaConcurrentModificationException] {
+        currentTxn.commit(
+          Seq(AddFile(
+            path = "current-legacy",
+            partitionValues = Map("p" -> "0"),
+            size = 1L,
+            modificationTime = 1L,
+            dataChange = true)),
+          ManualUpdate)
+      }
+    }
   }
 
   test("initial commit without metadata should fail") {
